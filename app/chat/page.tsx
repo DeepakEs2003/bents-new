@@ -1,0 +1,1782 @@
+'use client';
+
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { ArrowRight, PlusCircle, ArrowDown, X, BookOpen } from 'lucide-react';
+import { useChat } from 'ai/react';
+import { Button } from "@/components/ui/button";
+import { v4 as uuidv4 } from 'uuid';
+import { cn } from "@/lib/utils";
+import { Textarea } from "@/components/ui/textarea";
+import ReactMarkdown from 'react-markdown';
+
+import axios from 'axios';
+import Header from '@/components/Header';
+import YouTube from 'react-youtube';
+import { useAuth } from '@clerk/nextjs';
+import { useSession } from '@/lib/hooks/useSession';
+import { format } from 'date-fns';
+
+// Types
+interface Conversation {
+  id: string;
+  question: string;
+  text: string;
+  initial_answer?: string;
+  videoLinks?: VideoLinks;
+  related_products?: Product[];
+  timestamp: string;
+}
+
+interface Session {
+  id: string;
+  conversations: Conversation[];
+}
+
+interface VideoInfo {
+  urls: string[];
+  video_title?: string;
+  description?: string;
+  timestamp?: string;
+}
+
+interface VideoLinks {
+  [key: string]: {
+    urls: string[];
+    timestamp: string;
+    video_title: string;
+    description: string;
+  };
+}
+
+interface Product {
+  id: string;
+  title: string;
+  link: string;
+  tags: string[];
+  description?: string;
+  price?: string;
+  category?: string;
+  image_data?: string;
+}
+
+interface FAQQuestion {
+  id: string;
+  question_text: string;
+  category?: string;
+}
+
+// Add new interface for active query
+interface ActiveQuery {
+  question: string;
+  messageId?: string;
+  timestamp?: string;
+}
+
+// Add these new interfaces and constants near the top with other interfaces
+interface AnimatedTextProps {
+  texts: string[];
+  interval?: number;
+}
+
+const rotatingTexts = ['Woodworking ?', 'DIY Projects', 'Wood Finishing', 'Tool Usage'];
+
+// Constants
+const LOCAL_STORAGE_KEYS = {
+  SESSIONS: 'chat_sessions',
+  CURRENT_SESSION_ID: 'current_session_id',
+  CURRENT_CONVERSATION: 'current_conversation'
+};
+
+// Font family constant
+const systemFontFamily = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+// Helper functions
+const getYoutubeVideoId = (url: string): string | null => {
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+  const match = url.match(regExp);
+  return (match && match[2].length === 11) ? match[2] : null;
+};
+
+const getStartTime = (timestamp: string): number => {
+  const [minutes, seconds] = timestamp.split(':').map(Number);
+  return (minutes * 60) + seconds;
+};
+
+// Add these utility functions at the top with other utility functions
+const getYoutubeVideoIds = (urls: string[]) => {
+  if (!urls || !Array.isArray(urls) || urls.length === 0) return [];
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+  return urls.map(url => {
+    if (!url || typeof url !== 'string') return null;
+    const match = url.match(regExp);
+    return (match && match[2].length === 11) ? match[2] : null;
+  }).filter((id): id is string => id !== null);
+};
+
+// Helper function to load saved data
+const loadSavedData = async () => {
+  try {
+    const response = await axios.get('/api/session');
+    const savedSessions = response.data;
+    
+    if (Array.isArray(savedSessions) && savedSessions.length > 0) {
+      return {
+        sessions: savedSessions,
+        currentId: savedSessions[0].id,
+        conversations: savedSessions[0].conversations || []
+      };
+    }
+  } catch (error) {
+    console.error('Error loading saved data:', error);
+  }
+  
+  const defaultSession = { id: uuidv4(), conversations: [] };
+  return {
+    sessions: [defaultSession],
+    currentId: defaultSession.id,
+    conversations: []
+  };
+};
+
+// Add function to save sessions to database
+const saveSessionsToDatabase = async (sessions: Session[]) => {
+  try {
+    await axios.post('/api/session', {
+      sessionData: sessions
+    });
+  } catch (error) {
+    console.error('Error saving sessions to database:', error);
+  }
+};
+
+const ProductCard = ({ product }: { product: Product }) => {
+  return (
+    <a
+      href={product.link}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="flex-none bg-white dark:bg-gray-700 rounded-lg border min-w-[180px] px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors"
+    >
+      <p className="text-sm font-medium text-gray-900 dark:text-gray-100">
+        {product.title}
+      </p>
+    </a>
+  );
+};
+
+// Updated FixedMarkdownRenderer component
+const FixedMarkdownRenderer = ({ content }: { content: string }) => (
+  <ReactMarkdown
+    className="markdown-content"
+    components={{
+      root: ({ children, ...props }) => (
+        <div className="w-full text-gray-800 dark:text-gray-200" {...props}>{children}</div>
+      ),
+      p: ({ children, ...props }) => (
+        <p 
+          className="text-base leading-relaxed mb-3"
+          style={{ fontFamily: systemFontFamily }}
+          {...props}
+        >
+          {children}
+        </p>
+      ),
+      pre: ({ children, ...props }) => (
+        <pre className="w-full p-4 rounded bg-gray-50 dark:bg-gray-800 my-4 overflow-x-auto" {...props}>
+          {children}
+        </pre>
+      ),
+      code: ({ children, inline, ...props }) => (
+        inline ? 
+          <code className="px-1.5 py-0.5 rounded bg-gray-100 text-sm font-mono" {...props}>{children}</code> :
+          <code className="block w-full font-mono text-sm" {...props}>{children}</code>
+      ),
+      ul: ({ children, ...props }) => (
+        <ul className="list-disc pl-4 mb-3 space-y-1" {...props}>{children}</ul>
+      ),
+      ol: ({ children, ...props }) => (
+        <ol className="list-decimal pl-4 mb-3 space-y-1" {...props}>{children}</ol>
+      ),
+      li: ({ children, ...props }) => (
+        <li className="mb-1" {...props}>{children}</li>
+      ),
+      h1: ({ children, ...props }) => (
+        <h1 className="text-xl font-medium mb-3" {...props}>{children}</h1>
+      ),
+      h2: ({ children, ...props }) => (
+        <h2 className="text-lg font-medium mb-3" {...props}>{children}</h2>
+      ),
+      h3: ({ children, ...props }) => (
+        <h3 className="text-base font-medium mb-2" {...props}>{children}</h3>
+      ),
+      blockquote: ({ children, ...props }) => (
+        <blockquote 
+          className="border-l-4 border-gray-200 dark:border-gray-700 pl-4 my-4 italic"
+          {...props}
+        >
+          {children}
+        </blockquote>
+      ),
+      a: ({ children, href, ...props }) => (
+        <a 
+          href={href}
+          className="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-200 underline"
+          target="_blank"
+          rel="noopener noreferrer"
+          {...props}
+        >
+          {children}
+        </a>
+      )
+    }}
+  >
+    {content}
+  </ReactMarkdown>
+);
+
+// Update ConversationItem component
+const ConversationItem = ({ conv, index, isLatest }: { 
+  conv: Conversation; 
+  index: number; 
+  isLatest: boolean;
+}) => {
+  const conversationRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isLatest) {
+      conversationRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [isLatest]);
+
+  // Add renderSourceVideos function inside ConversationItem
+  const renderSourceVideos = (videoLinks: VideoLinks | undefined) => {
+    if (!videoLinks || Object.keys(videoLinks).length === 0) return null;
+
+    const allVideos = Object.values(videoLinks).filter(video => video && video.urls?.[0]);
+    
+    if (allVideos.length === 0) return null;
+
+    return (
+      <div className="mt-6">
+        <h3 className="text-lg font-semibold mb-4">Related Videos</h3>
+        <div className="relative">
+          <div className="overflow-x-scroll" style={{ 
+            scrollbarWidth: 'thin',
+            scrollbarColor: '#888 #f1f1f1',
+            WebkitOverflowScrolling: 'touch'
+          }}>
+            <div className="flex gap-4 pb-4">
+              {allVideos.map((video, index) => {
+                const videoId = getYoutubeVideoIds([video.urls[0]])[0];
+                if (!videoId) return null;
+
+                const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
+                const fullVideoUrl = video.urls[0].split('&t=')[0];
+
+                return (
+                  <div
+                    key={index}
+                    className="flex-shrink-0 w-[250px] bg-white dark:bg-gray-700 rounded-[8px] border shadow-sm overflow-hidden hover:shadow-md transition-shadow flex flex-col"
+                  >
+                    <a
+                      href={`${video.urls[0]}${video.timestamp ? `&t=${getStartTime(video.timestamp)}s` : ''}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="block flex-grow"
+                    >
+                      <div className="relative">
+                        <img 
+                          src={thumbnailUrl}
+                          alt={video.video_title || 'Video thumbnail'}
+                          className="w-full h-[140px] object-cover"
+                        />
+                        <div className="absolute inset-0 bg-black/0 hover:bg-black/10 transition-colors flex items-center justify-center">
+                          <div className="w-12 h-12 rounded-full bg-black/75 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity">
+                            <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24">
+                              <path d="M8 5v14l11-7z"/>
+                            </svg>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="p-3 flex-grow">
+                        <h4 className="font-medium text-sm line-clamp-2 mb-2">
+                          {video.video_title || 'Video Title'}
+                        </h4>
+                        {video.description && (
+                          <p className="text-sm text-gray-600 line-clamp-2 mb-2">
+                            {video.description.replace(/"/g, '')}
+                          </p>
+                        )}
+                        {video.timestamp && (
+                          <div className="flex items-center text-sm text-gray-500 mb-2">
+                            <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                            <span>Starts at {video.timestamp}</span>
+                          </div>
+                        )}
+                      </div>
+                    </a>
+                    <div className="border-t bg-gray-50 dark:bg-gray-800">
+                      <a
+                        href={fullVideoUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="p-3 flex items-center justify-center hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors group"
+                      >
+                        <span className="text-sm font-medium text-gray-700 dark:text-gray-300 group-hover:text-gray-900">
+                          Watch Full Video
+                        </span>
+                      </a>  
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div ref={conversationRef} className="w-full bg-white dark:bg-gray-800 rounded-lg shadow-sm p-6 mb-4 mt-16 sm:mt-0">
+      {/* Question Section */}
+      <div className="mb-4 pb-4 border-b dark:border-gray-700">
+        <div className="flex items-center gap-2">
+          <p className="text-gray-800 dark:text-gray-200 break-words font-bold" style={{ fontFamily: systemFontFamily }}>
+            {conv.question}
+          </p>
+        </div>
+      </div>
+
+      {/* Answer Section */}
+      <div className="prose prose-sm max-w-none mb-4">
+        <FixedMarkdownRenderer content={conv.text} />
+      </div>
+
+      {/* Videos Section - Now using renderSourceVideos */}
+      {renderSourceVideos(conv.videoLinks)}
+
+      {/* Products Section */}
+      {conv.related_products && conv.related_products.length > 0 && (
+        <div className="mt-6">
+          <h3 className="text-base font-semibold mb-3" style={{ fontFamily: systemFontFamily }}>
+            Related Products
+          </h3>
+          <div className="relative">
+            <div className="overflow-x-scroll" style={{ 
+              scrollbarWidth: 'thin',
+              scrollbarColor: '#888 #f1f1f1',
+              WebkitOverflowScrolling: 'touch'
+            }}>
+              <div className="flex gap-4 pb-4">
+                {conv.related_products.map((product, idx) => (
+                  <ProductCard key={idx} product={product} />
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Update ProcessingCard component
+const ProcessingCard = ({ 
+  query, 
+  loadingProgress, 
+  setLoadingProgress 
+}: { 
+  query: string, 
+  loadingProgress: number,
+  setLoadingProgress: React.Dispatch<React.SetStateAction<number>>
+}) => {
+  const loadingCardRef = useRef<HTMLDivElement>(null);
+  const currentStep = Math.min(Math.floor(loadingProgress / 25), 3);
+
+  useEffect(() => {
+    if (loadingCardRef.current) {
+      setTimeout(() => {
+        loadingCardRef.current?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start'
+        });
+      }, 100);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (loadingProgress < 100) {
+      const timer = setTimeout(() => {
+        setLoadingProgress(prev => Math.min(prev + 1, 100));
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [loadingProgress, setLoadingProgress]);
+
+  return (
+    <div 
+      ref={loadingCardRef} 
+      className="w-full bg-white dark:bg-gray-800 rounded-lg p-4 mb-4 mt-16 sm:mt-0 shadow-sm transition-all duration-500 ease-in-out"
+    >
+      <div className="space-y-4">
+        {/* Header Section */}
+        <div className="flex items-center justify-between border-b pb-3">
+          <div className="flex items-center gap-2">
+            <div className="relative w-8 h-8">
+              <div className="absolute inset-0 bg-blue-50 rounded-full animate-ping opacity-40" />
+              <div className="relative flex items-center justify-center w-8 h-8 bg-blue-100 rounded-full">
+                <svg 
+                  className="w-4 h-4 text-blue-600 animate-pulse" 
+                  fill="none" 
+                  viewBox="0 0 24 24" 
+                  stroke="currentColor"
+                >
+                  <path 
+                    strokeLinecap="round" 
+                    strokeLinejoin="round" 
+                    strokeWidth={2} 
+                    d="M13 10V3L4 14h7v7l9-11h-7z" 
+                  />
+                </svg>
+              </div>
+            </div>
+            <div>
+              <h2 className="text-sm font-medium text-gray-800 dark:text-gray-200">Processing Query</h2>
+              <p className="text-xs text-gray-500 truncate max-w-[200px]">{query}</p>
+            </div>
+          </div>
+          <div className="text-sm font-medium text-blue-600">
+            {loadingProgress}%
+          </div>
+        </div>
+        
+        {/* Steps Section */}
+        <div className="grid grid-cols-1 gap-2">
+          {processingSteps.map((step, index) => {
+            const isComplete = index < currentStep;
+            const isCurrent = index === currentStep;
+            
+            return (
+              <div 
+                key={step} 
+                className={cn(
+                  "transform transition-all duration-300 ease-in-out",
+                  "py-2 px-3 rounded-md border",
+                  isComplete ? "border-green-200 dark:border-green-700 bg-green-50 dark:bg-green-900/30" : 
+                  isCurrent ? "border-blue-200 dark:border-blue-700 bg-blue-50 dark:bg-blue-900/30" : 
+                  "border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 opacity-50"
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  <div 
+                    className={cn(
+                      "w-5 h-5 rounded-full flex items-center justify-center transition-all duration-300",
+                      isComplete ? "bg-green-500" : 
+                      isCurrent ? "bg-blue-500" : 
+                      "bg-gray-200 dark:bg-gray-700"
+                    )}
+                  >
+                    {isComplete ? (
+                      <svg 
+                        className="w-3 h-3 text-white animate-scale-check" 
+                        fill="none" 
+                        viewBox="0 0 24 24" 
+                        stroke="currentColor"
+                      >
+                        <path 
+                          strokeLinecap="round" 
+                          strokeLinejoin="round" 
+                          strokeWidth={2} 
+                          d="M5 13l4 4L19 7" 
+                        />
+                      </svg>
+                    ) : isCurrent ? (
+                      <div className="w-2 h-2 rounded-full bg-white animate-pulse" />
+                    ) : (
+                      <div className="w-2 h-2 rounded-full bg-gray-400 dark:bg-gray-600" />
+                    )}
+                  </div>
+                  <span 
+                    className={cn(
+                      "text-sm transition-all duration-300",
+                      isComplete ? "text-green-700" : 
+                      isCurrent ? "text-blue-700" : 
+                      "text-gray-400 dark:text-gray-400"
+                    )}
+                  >
+                    {step}
+                  </span>
+                  {isCurrent && (
+                    <div className="flex-1 flex justify-end">
+                      <div className="flex space-x-0.5">
+                        {[...Array(3)].map((_, i) => (
+                          <div
+                            key={i}
+                            className={cn(
+                              "w-1.5 h-1.5 rounded-full bg-blue-500",
+                              "animate-bounce",
+                            )}
+                            style={{
+                              animationDelay: `${i * 0.2}s`
+                            }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Add these keyframes to your global CSS or tailwind.config.js
+const scaleCheckKeyframes = {
+  '0%': { transform: 'scale(0)' },
+  '50%': { transform: 'scale(1.2)' },
+  '100%': { transform: 'scale(1)' }
+};
+
+// Add this near the top where other components are defined
+const ConversationHistoryButton = ({ 
+  sessions,
+  currentSessionId,
+  onSessionSelect,
+  onNewConversation 
+}: { 
+  sessions: Session[];
+  currentSessionId: string;
+  onSessionSelect: (id: string) => void;
+  onNewConversation: () => void;
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <div className="relative">
+      <Button
+        variant="outline"
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-2"
+      >
+        <span>History</span>
+      </Button>
+
+      {isOpen && (
+        <>
+          <div 
+            className="fixed inset-0 bg-black/20" 
+            onClick={() => setIsOpen(false)}
+          />
+          <div className="absolute right-0 mt-2 w-72 bg-white dark:bg-gray-800 rounded-lg shadow-lg border overflow-hidden z-50">
+            <div className="p-2">
+              <Button
+                onClick={() => {
+                  onNewConversation();
+                  setIsOpen(false);
+                }}
+                className="w-full justify-start text-left mb-2"
+                variant="ghost"
+              >
+                <PlusCircle className="mr-2 h-4 w-4" />
+                New Conversation
+              </Button>
+              <div className="space-y-1 max-h-96 overflow-y-auto">
+                {sessions.map((session) => (
+                  <Button
+                    key={session.id}
+                    onClick={() => {
+                      onSessionSelect(session.id);
+                      setIsOpen(false);
+                    }}
+                    variant={session.id === currentSessionId ? "secondary" : "ghost"}
+                    className="w-full justify-start text-left"
+                  >
+                    {session.conversations?.[0]?.question || "New Conversation"}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// Add this near the ConversationHistoryButton component
+const ChatSidebar = ({ 
+  isOpen, 
+  onClose,
+  sessions,
+  currentSessionId,
+  onSessionSelect,
+  onNewConversation
+}: { 
+  isOpen: boolean;
+  onClose: () => void;
+  sessions: Session[];
+  currentSessionId: string | null;
+  onSessionSelect: (sessionId: string) => void;
+  onNewConversation: () => void;
+}) => {
+  return (
+    <>
+      {isOpen && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50">
+          <div className="fixed top-0 left-0 h-full w-80 bg-white dark:bg-black transform transition-transform duration-300 ease-in-out overflow-y-auto">
+            <div className="p-6">
+              <div className="flex justify-between items-center mb-6">
+                <h2 className="text-xl font-bold text-gray-900 dark:text-white">Chat History</h2>
+                <button onClick={onClose} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300">
+                  <X size={24} />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <button
+                  onClick={() => {
+                    onNewConversation();
+                    onClose();
+                  }}
+                  className="w-full px-4 py-2 text-white bg-[rgba(23,155,215,255)] rounded-md hover:bg-[rgba(20,139,193,255)]"
+                >
+                  New Chat
+                </button>
+
+                {sessions.map((session) => (
+                  <div
+                    key={session.id}
+                    onClick={() => {
+                      onSessionSelect(session.id);
+                      onClose();
+                    }}
+                    className={cn(
+                      "p-4 rounded-lg cursor-pointer transition-all",
+                      "hover:bg-gray-100 dark:hover:bg-gray-600",
+                      session.id === currentSessionId 
+                        ? "bg-gray-100 dark:bg-gray-700" 
+                        : "bg-white dark:bg-gray-700",
+                      "border border-gray-200 dark:border-gray-600"
+                    )}
+                  >
+                    <p className="font-medium text-gray-900 dark:text-white line-clamp-2">
+                      {session.conversations[0]?.question || "New conversation"}
+                    </p>
+                    {session.conversations[0]?.timestamp && (
+                      <p className="text-sm text-gray-500 dark:text-gray-300 mt-1">
+                        {format(new Date(session.conversations[0].timestamp), 'MMM d, yyyy')}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
+
+// Update this component only
+const GradientBackground = () => (
+  <div className="fixed inset-0 w-full h-full z-[-1]">
+    <div className="relative w-full h-full bg-[#e6f3ff] dark:bg-black transition-colors duration-700 ease-in-out">
+      <div className="absolute inset-0" 
+        style={{
+          backgroundImage: `
+            linear-gradient(135deg, var(--pattern-color) 25%, transparent 25%) -40px 0,
+            linear-gradient(225deg, var(--pattern-color) 25%, transparent 25%) -40px 0,
+            linear-gradient(315deg, var(--pattern-color) 25%, transparent 25%),
+            linear-gradient(45deg, var(--pattern-color) 25%, transparent 25%)
+          `,
+          backgroundSize: '80px 80px',
+          backgroundColor: 'rgba(59, 130, 246, 0.05)', // Light blue background
+          opacity: '0.4',
+          '--pattern-color': 'rgba(59, 130, 246, 0.1)', // Light blue pattern
+          transition: 'all 700ms cubic-bezier(0.4, 0, 0.2, 1)'
+        } as React.CSSProperties}
+      />
+      <div className="absolute inset-0"
+        style={{
+          background: `
+            linear-gradient(90deg, 
+              var(--grid-color) 1px, 
+              transparent 1px
+            ),
+            linear-gradient(180deg, 
+              var(--grid-color) 1px, 
+              transparent 1px
+            )
+          `,
+          backgroundSize: '20px 20px',
+          mask: 'radial-gradient(circle at 50% 50%, black, transparent)',
+          '--grid-color': 'rgba(59, 130, 246, 0.07)', // Light blue grid
+          transition: 'all 700ms cubic-bezier(0.4, 0, 0.2, 1)'
+        } as React.CSSProperties}
+      />
+    </div>
+  </div>
+);
+
+// Add the AnimatedText component before the main ChatPage component
+const AnimatedText = ({ texts, interval = 2000 }: AnimatedTextProps) => {
+  const [currentIndex, setCurrentIndex] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentIndex((prev) => (prev + 1) % texts.length);
+    }, interval);
+
+    return () => clearInterval(timer);
+  }, [texts, interval]);
+
+  return (
+    <div className="relative h-[1.2em] overflow-hidden">
+      {texts.map((text, index) => (
+        <div
+          key={text}
+          className={cn(
+            "absolute w-full transition-all duration-500 ease-in-out",
+            index === currentIndex 
+              ? "transform-none opacity-100" 
+              : "transform translate-y-full opacity-0"
+          )}
+        >
+          {text}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// Main Chat Page Component
+export default function ChatPage() {
+  const { userId = null } = useAuth();
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const {
+    sessions,
+    setSessions,
+    currentSessionId,
+    setCurrentSessionId,
+    isLoading: sessionsLoading,
+    error: sessionsError
+  } = useSession();
+
+  // Initialize with empty values
+  const [currentConversation, setCurrentConversation] = useState<Conversation[]>([]);
+  
+  // Error states
+  const [error, setError] = useState<string | null>(null);
+  const [wsError, setWsError] = useState<string | null>(null);
+
+  // Add effect to handle page load/refresh
+  useEffect(() => {
+    if (userId) {
+      const initializeNewSession = async () => {
+        try {
+          const newSessionId = uuidv4();
+          const newSession: Session = {
+            id: newSessionId,
+            conversations: []
+          };
+
+          setSessions([newSession]);
+          setCurrentSessionId(newSessionId);
+          setShowInitialQuestions(true);
+          currentQuestionRef.current = "";
+          setCurrentConversation([]); // Clear current conversation
+          
+          if (userId) {
+            await axios.post('/api/set-session', {
+              sessions: [newSession]
+            }, {
+              headers: {
+                'x-user-id': userId
+              }
+            });
+          }
+        } catch (error) {
+          console.error('Error initializing new session:', error);
+        }
+      };
+
+      initializeNewSession();
+    }
+  }, [userId, setSessions, setCurrentSessionId]);
+
+  const manageSession = useCallback(async () => {
+    try {
+      // Clear existing state
+      setCurrentConversation([]);
+      setShowInitialQuestions(true);
+      setProcessingQuery("");
+      setSearchQuery("");
+      
+      const newSessionId = uuidv4();
+      const newSession: Session = {
+        id: newSessionId,
+        conversations: []
+      };
+
+      if (userId) {
+        const response = await axios.post('/api/set-session', {
+          sessions: [newSession]
+        }, {
+          headers: {
+            'x-user-id': userId
+          }
+        });
+
+        if (response.data.success) {
+          setSessions(prevSessions => [...prevSessions, newSession]);
+          setCurrentSessionId(newSessionId);
+          setShowInitialQuestions(true);
+          currentQuestionRef.current = "";
+        } else {
+          throw new Error('Failed to save new session');
+        }
+      }
+    } catch (error) {
+      console.error('Error in manageSession:', error);
+      setError('Failed to create new session');
+    }
+  }, [userId, setSessions, setCurrentSessionId]);
+
+  // Update handleNewConversation to use manageSession
+  const handleNewConversation = useCallback(() => {
+    manageSession();
+  }, [manageSession]);
+
+  // Other states
+  const [showInitialQuestions, setShowInitialQuestions] = useState(true);
+  const [loadingProgress, setLoadingProgress] = useState(0);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [loadingQuestionIndex, setLoadingQuestionIndex] = useState<number | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [processingQuery, setProcessingQuery] = useState<string>("");
+  const [randomQuestions, setRandomQuestions] = useState<string[]>([]);
+
+  // Response states
+  const [firstResponse, setFirstResponse] = useState<{ question: string; content: string } | null>(null);
+  const [secondResponse, setSecondResponse] = useState<{ videoLinks: VideoLinks; relatedProducts: Product[] } | null>(null);
+  const [isSecondResponseLoading, setIsSecondResponseLoading] = useState(false);
+
+  // Refs
+  const messageEndRef = useRef<HTMLDivElement>(null);
+  const currentQuestionRef = useRef<string>("");
+
+  // Add new refs and state for scrolling
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [isAutoScrollEnabled, setIsAutoScrollEnabled] = useState(true);
+  const [showScrollButton, setShowScrollButton] = useState(false);
+  const [userHasScrolled, setUserHasScrolled] = useState(false);
+  const lastScrollPosition = useRef(0);
+
+  const { messages, append, isLoading } = useChat({
+    api: '/api/chat',
+    initialMessages: [],
+    onResponse: (response) => {
+      setIsStreaming(true);
+      setLoadingProgress(3);
+      setError(null);
+      setWsError(null);
+    },
+    onFinish: async (message) => {
+      setIsStreaming(false);
+      
+      const currentQuestion = currentQuestionRef.current;
+      if (!currentQuestion?.trim() || !currentSessionId) {
+        return;
+      }
+      
+      setIsSecondResponseLoading(true);
+      try {
+        const linksResponse = await axios.post('/api/links', {
+          answer: message.content
+        });
+        
+        const newConversation = {
+          id: uuidv4(),
+          question: currentQuestion,
+          text: message.content,
+          timestamp: new Date().toISOString(),
+          videoLinks: linksResponse.data.videoReferences || {},
+          related_products: linksResponse.data.relatedProducts || []
+        };
+
+        // Update both database and local state
+        if (userId) {
+          const updatedSession = {
+            id: currentSessionId,
+            conversations: [...currentConversation, newConversation]
+          };
+
+          // Update database
+          await axios.post('/api/set-session', { 
+            sessions: [updatedSession] 
+          }, {
+            headers: {
+              'x-user-id': userId
+            }
+          });
+
+          // Update local state
+          setSessions(prevSessions => 
+            prevSessions.map(s => 
+              s.id === currentSessionId ? updatedSession : s
+            )
+          );
+          setCurrentConversation(prev => [...prev, newConversation]);
+        }
+      } catch (error) {
+        console.error('Error in onFinish:', error);
+        setError('Error updating chat history');
+        // Attempt to recover state
+        await recoverState();
+      } finally {
+        setIsSecondResponseLoading(false);
+        setProcessingQuery("");
+      }
+    }
+  });
+
+  // Add recoverState function
+  const recoverState = useCallback(async () => {
+    if (!userId) return;
+    
+    try {
+      const response = await axios.get('/api/get-session', {
+        headers: {
+          'x-user-id': userId
+        }
+      });
+
+      if (Array.isArray(response.data) && response.data.length > 0) {
+        setSessions(response.data);
+        const lastSession = response.data[response.data.length - 1];
+        setCurrentSessionId(lastSession.id);
+        setCurrentConversation(lastSession.conversations || []);
+        setShowInitialQuestions(!(lastSession.conversations?.length > 0));
+      }
+    } catch (error) {
+      console.error('Failed to recover state:', error);
+      setError('Failed to load chat history');
+    }
+  }, [userId, setSessions, setCurrentSessionId]);
+
+  // Add check if near bottom function
+  const checkIfNearBottom = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return true;
+    
+    const threshold = 100; // pixels from bottom
+    const position = container.scrollHeight - container.scrollTop - container.clientHeight;
+    return position < threshold;
+  }, []);
+
+  const handleScroll = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    // Detect if user is scrolling up
+    if (container.scrollTop < lastScrollPosition.current) {
+      setUserHasScrolled(true);
+      setIsAutoScrollEnabled(false);
+    }
+
+    // Show/hide scroll button based on position
+    setShowScrollButton(!checkIfNearBottom());
+    lastScrollPosition.current = container.scrollTop;
+  }, [checkIfNearBottom]);
+
+  const scrollToBottom = () => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    setIsAutoScrollEnabled(true);
+    setUserHasScrolled(false);
+    
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: 'smooth'
+    });
+  };
+
+  // Add these useEffects:
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !isStreaming || !isAutoScrollEnabled) return;
+
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: 'smooth'
+    });
+  }, [isStreaming, isAutoScrollEnabled]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    return () => container.removeEventListener('scroll', handleScroll);
+  }, [handleScroll]);
+
+  useEffect(() => {
+    if (isStreaming) {
+      setIsAutoScrollEnabled(!userHasScrolled);
+    } else {
+      setUserHasScrolled(false);
+      setIsAutoScrollEnabled(true);
+    }
+  }, [isStreaming]);
+
+  // Update handleSearch to include error handling and state recovery
+  const handleSearch = async (e: React.FormEvent | null, index?: number) => {
+    if (e) e.preventDefault();
+    const query = index !== undefined ? randomQuestions[index] : searchQuery;
+    
+    if (!query.trim() || isLoading) return;
+    
+    setProcessingQuery(query);
+    currentQuestionRef.current = query;
+    setShowInitialQuestions(false);
+    
+    try {
+      if (!currentSessionId) {
+        await manageSession();
+      }
+      
+      await append({
+        role: 'user',
+        content: query,
+        createdAt: new Date()
+      });
+
+      setSearchQuery("");
+      
+      setTimeout(() => {
+        messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 100);
+    } catch (error) {
+      console.error('Search Error:', error);
+      setError('Error processing your request');
+      await recoverState();
+    }
+  };
+
+  // Loading State Component
+  const LoadingState = () => (
+    <div className="w-full">
+      <div className="mt-4">
+        <div className="bg-white rounded-lg p-4 mb-4">
+          <div className="space-y-4">
+            {/* Video skeleton loader */}
+            <div>
+              <div className="flex items-center gap-3 mb-4">
+                <div className="animate-pulse w-8 h-8 rounded-full bg-[rgba(23,155,215,255)]/20 flex items-center justify-center">
+                  <svg className="w-4 h-4 text-[rgba(23,155,215,255)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                </div>
+                <h3 className="text-base font-medium text-gray-900">Processing Related Videos</h3>
+              </div>
+              <div className="flex overflow-x-auto space-x-4">
+                {[1, 2].map((i) => (
+                  <div key={i} className="flex-none w-[280px] bg-white border rounded-lg overflow-hidden">
+                    <div className="aspect-video w-full bg-gray-200 animate-pulse" />
+                    <div className="p-3">
+                      <div className="h-4 bg-gray-200 rounded animate-pulse mb-2" />
+                      <div className="h-4 bg-gray-200 rounded animate-pulse w-2/3" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            
+            {/* Products skeleton loader */}
+            <div>
+              <div className="flex items-center gap-3 mb-4">
+                <div className="animate-pulse w-8 h-8 rounded-full bg-[rgba(23,155,215,255)]/20 flex items-center justify-center">
+                  <svg className="w-4 h-4 text-[rgba(23,155,215,255)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+                  </svg>
+                </div>
+                <h3 className="text-base font-medium text-gray-900">Finding Related Products</h3>
+              </div>
+              <div className="flex overflow-x-auto space-x-4">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="flex-none min-w-[180px] bg-white border rounded-lg px-4 py-3">
+                    <div className="h-4 bg-gray-200 rounded animate-pulse mb-2" />
+                    <div className="h-4 bg-gray-200 rounded animate-pulse w-2/3" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  // Replace the existing renderConversations function
+  const renderConversations = () => {
+    const messageId = messages.length > 0 ? messages[messages.length - 1].id : 'default';
+    
+    return (
+      <div className="relative" key="conversations-container">
+        <div
+          ref={containerRef}
+          className="w-full overflow-y-auto scrollbar-none mt-8 sm:mt-0"
+          style={{ 
+            height: 'calc(100vh - 200px)',
+            paddingBottom: '80px',
+            msOverflowStyle: 'none',
+            scrollbarWidth: 'none'
+          }}
+        >
+          <style jsx global>{`
+            div::-webkit-scrollbar {
+              display: none;
+            }
+          `}</style>
+
+          {/* Map over completed conversations */}
+          {currentConversation.map((conv, index) => (
+            <ConversationItem 
+              key={`conv-${conv.id}-${index}`}
+              conv={conv}
+              index={index}
+              isLatest={conv.id === currentConversation[currentConversation.length - 1]?.id}
+            />
+          ))}
+
+          {/* Processing Card */}
+          {isLoading && !isStreaming && (
+            <ProcessingCard
+              query={processingQuery}
+              loadingProgress={loadingProgress}
+              setLoadingProgress={setLoadingProgress}
+            />
+          )}
+
+          {/* Single container for both streaming and processing states */}
+          {(isStreaming || isSecondResponseLoading) && messages.length > 0 && !currentConversation.find(conv => conv.question === processingQuery) && (
+            <div key={`streaming-${messageId}`} className="w-full bg-white dark:bg-gray-800 rounded-lg shadow-sm p-6 mb-4 mt-16 sm:mt-0">
+              <div className="mb-4 pb-4 border-b">
+                <div className="flex items-center gap-2">
+                  <p className="text-gray-800 dark:text-gray-200 break-words font-bold" style={{ fontFamily: systemFontFamily }}>
+                    {processingQuery}
+                  </p>
+                </div>
+              </div>
+
+              <div className="prose prose-sm max-w-none mb-4">
+                <div className="text-base leading-relaxed" style={{ fontFamily: systemFontFamily }}>
+                  <FixedMarkdownRenderer 
+                    key={`markdown-${messageId}`}
+                    content={messages[messages.length - 1].content} 
+                  />
+                </div>
+              </div>
+
+              {isSecondResponseLoading && (
+                <div className="w-full">
+                  <div className="mt-4">
+                    <div className="bg-white dark:bg-gray-800 rounded-lg p-4 mb-4">
+                      <div className="space-y-6">
+                        {/* Video skeleton loader */}
+                        <div>
+                          <div className="flex items-center gap-3 mb-4">
+                            <div className="animate-pulse w-8 h-8 rounded-full bg-[rgba(23,155,215,255)]/20 flex items-center justify-center">
+                              <svg className="w-4 h-4 text-[rgba(23,155,215,255)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                              </svg>
+                            </div>
+                            <h3 className="text-base font-medium text-gray-900">Processing Related Videos</h3>
+                          </div>
+                          <div className="flex overflow-x-auto space-x-4">
+                            {[1, 2].map((i) => (
+                              <div key={i} className="flex-none w-[280px] bg-white dark:bg-gray-700 border rounded-lg overflow-hidden">
+                                <div className="aspect-video w-full bg-gray-200 animate-pulse" />
+                                <div className="p-3">
+                                  <div className="h-4 bg-gray-200 rounded animate-pulse mb-2" />
+                                  <div className="h-4 bg-gray-200 rounded animate-pulse w-2/3" />
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        
+                        {/* Products skeleton loader */}
+                        <div>
+                          <div className="flex items-center gap-3 mb-4">
+                            <div className="animate-pulse w-8 h-8 rounded-full bg-[rgba(23,155,215,255)]/20 flex items-center justify-center">
+                              <svg className="w-4 h-4 text-[rgba(23,155,215,255)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+                              </svg>
+                            </div>
+                            <h3 className="text-base font-medium text-gray-900">Finding Related Products</h3>
+                          </div>
+                          <div className="flex overflow-x-auto space-x-4">
+                            {[1, 2, 3].map((i) => (
+                              <div key={i} className="flex-none min-w-[180px] bg-white dark:bg-gray-700 border rounded-lg px-4 py-3">
+                                <div className="h-4 bg-gray-200 rounded animate-pulse mb-2" />
+                                <div className="h-4 bg-gray-200 rounded animate-pulse w-2/3" />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Scroll button remains unchanged */}
+          {showScrollButton && (isStreaming || isSecondResponseLoading) && (
+            <button
+              onClick={scrollToBottom}
+              type="button"
+              className="fixed bottom-24 right-8 bg-gray-800 text-white rounded-full p-3 shadow-lg hover:bg-gray-700 transition-colors z-50 flex items-center gap-2"
+            >
+              <ArrowDown className="w-5 h-5" />
+              <span className="text-sm font-medium pr-2">New content</span>
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // Effects
+  useEffect(() => {
+    const handleWebSocketError = (event: Event) => {
+      const customError = {
+        type: 'WebSocketError',
+        originalMessage: event instanceof ErrorEvent ? event.message : 'Unknown error',
+        timestamp: new Date().toISOString()
+      };
+      
+      console.error('WebSocket error:', customError);
+      setWsError(customError.originalMessage);
+      setIsStreaming(false);
+      setLoadingProgress(0);
+    };
+
+    window.addEventListener('websocketerror', handleWebSocketError);
+    return () => window.removeEventListener('websocketerror', handleWebSocketError);
+  }, []);
+
+  useEffect(() => {
+    messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  useEffect(() => {
+    const selectedSession = sessions.find(session => session.id === currentSessionId);
+    if (selectedSession) {
+      setCurrentConversation(selectedSession.conversations);
+      setShowInitialQuestions(selectedSession.conversations.length === 0);
+    }
+  }, [sessions, currentSessionId]);
+
+  useEffect(() => {
+    if (isLoading && loadingProgress < 3) {
+      const timer = setTimeout(() => {
+        setLoadingProgress(prev => Math.min(prev + 1, 3));
+      }, 300);
+      return () => clearTimeout(timer);
+    }
+  }, [isLoading, loadingProgress]);
+
+  useEffect(() => {
+    const fetchQuestions = async () => {
+      try {
+        const response = await axios.get('/api/random');
+        setRandomQuestions(response.data.map((q: any) => q.question_text));
+      } catch (error) {
+        console.error('Error fetching questions:', error);
+      }
+    };
+
+    fetchQuestions();
+  }, []);
+
+  // Handlers
+  const handleQuestionSelect = (question: string, index: number) => {
+    setLoadingQuestionIndex(index);
+    setProcessingQuery(question);
+    setShowInitialQuestions(false);
+    setLoadingProgress(0);
+    setCurrentConversation([]); // Clear existing conversations
+    
+    // Delay the search to allow UI to update
+    setTimeout(() => {
+      handleSearch(null, index);
+    }, 100);
+  };
+
+  const handleSessionSelect = (sessionId: string) => {
+    const selectedSession = sessions.find(session => session.id === sessionId);
+    if (selectedSession) {
+      setCurrentSessionId(sessionId);
+      setCurrentConversation(selectedSession.conversations);
+      setShowInitialQuestions(selectedSession.conversations.length === 0);
+    }
+  };
+
+  const saveSessionsToDB = async (updatedSessions: Session[]) => {
+    if (!userId) {
+      console.log('No user ID available, skipping session save');
+      return;
+    }
+
+    // Validate and clean sessions data
+    const validSessions = updatedSessions.filter(session => 
+      session && 
+      session.id && 
+      Array.isArray(session.conversations) &&
+      session.conversations.every(conv => 
+        conv.question && 
+        conv.text && 
+        conv.timestamp
+      )
+    );
+
+    if (validSessions.length === 0) {
+      console.error('No valid sessions to save');
+      return;
+    }
+
+    try {
+      const currentSession = validSessions.find(s => s.id === currentSessionId);
+      if (!currentSession) {
+        console.error('Current session not found in valid sessions');
+        return;
+      }
+
+      const response = await axios.post('/api/set-session', { 
+        sessions: [currentSession] // Only save the current session
+      }, {
+        headers: {
+          'x-user-id': userId
+        }
+      });
+      
+      if (!response.data.success) {
+        throw new Error('Failed to save session');
+      }
+
+      // Update local state to match database
+      setSessions(validSessions);
+      
+    } catch (error) {
+      console.error('Failed to save sessions to database:', error);
+      setError('Failed to save chat history');
+    }
+  };
+
+  // Add these constants at the top of your chat page
+  const LOCAL_STORAGE_KEYS = {
+    SESSIONS: 'chat_sessions',
+    CURRENT_SESSION_ID: 'current_session_id',
+    CURRENT_CONVERSATION: 'current_conversation'
+  };
+
+  // Add this helper function
+  const getLocalStorage = (key: string, defaultValue: any) => {
+    if (typeof window === 'undefined') return defaultValue;
+    try {
+      const item = localStorage.getItem(key);
+      return item ? JSON.parse(item) : defaultValue;
+    } catch (error) {
+      console.error(`Error reading ${key} from localStorage:`, error);
+      return defaultValue;
+    }
+  };
+
+  // Add this helper function
+  const setLocalStorage = (key: string, value: any) => {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+      console.error(`Error writing ${key} to localStorage:`, error);
+    }
+  };
+
+  // Modify your useEffect hooks in the chat page component
+  useEffect(() => {
+    if (!userId) {
+      // Clear local storage when user is not logged in
+      localStorage.removeItem(LOCAL_STORAGE_KEYS.SESSIONS);
+      localStorage.removeItem(LOCAL_STORAGE_KEYS.CURRENT_SESSION_ID);
+      localStorage.removeItem(LOCAL_STORAGE_KEYS.CURRENT_CONVERSATION);
+      
+      // Reset states
+      setSessions([]);
+      setCurrentSessionId(null);
+      setCurrentConversation([]);
+      setShowInitialQuestions(true);
+      return;
+    }
+
+    // Load local storage data only if user is logged in
+    const localSessions = getLocalStorage(LOCAL_STORAGE_KEYS.SESSIONS, []);
+    const localCurrentSessionId = getLocalStorage(LOCAL_STORAGE_KEYS.CURRENT_SESSION_ID, null);
+    const localCurrentConversation = getLocalStorage(LOCAL_STORAGE_KEYS.CURRENT_CONVERSATION, []);
+
+    // Only set states if we have existing data
+    if (localSessions.length > 0) {
+      setSessions(localSessions);
+      setCurrentSessionId(localCurrentSessionId);
+      setCurrentConversation(localCurrentConversation);
+      setShowInitialQuestions(localCurrentConversation.length === 0);
+    }
+  }, [userId]);
+
+  // Add effect to update local storage when sessions change
+  useEffect(() => {
+    if (!userId) {
+      return; // Don't save to local storage if user is not logged in
+    }
+    
+    if (sessions.length > 0) {
+      setLocalStorage(LOCAL_STORAGE_KEYS.SESSIONS, sessions);
+    }
+  }, [sessions, userId]);
+
+  // Add effect to update local storage when current session changes
+  useEffect(() => {
+    if (!userId) {
+      return; // Don't save to local storage if user is not logged in
+    }
+
+    if (currentSessionId) {
+      setLocalStorage(LOCAL_STORAGE_KEYS.CURRENT_SESSION_ID, currentSessionId);
+    }
+  }, [currentSessionId, userId]);
+
+  // Add effect to update local storage when current conversation changes
+  useEffect(() => {
+    if (!userId) {
+      return; // Don't save to local storage if user is not logged in
+    }
+
+    setLocalStorage(LOCAL_STORAGE_KEYS.CURRENT_CONVERSATION, currentConversation);
+  }, [currentConversation, userId]);
+
+  // Main render
+  return (
+    <div className="flex flex-col min-h-screen bg-[#F8F9FA] dark:bg-gray-900">
+      <div className="fixed inset-0 overflow-hidden">
+        <div className="absolute inset-0">
+          <div className="min-h-screen">
+            <Header 
+              userId={userId}
+              sessions={sessions}
+              currentSessionId={currentSessionId}
+              onSessionSelect={handleSessionSelect}
+              onNewConversation={handleNewConversation}
+            />
+            
+            
+
+            {/* ChatSidebar remains unchanged */}
+            <ChatSidebar
+              isOpen={isHistoryOpen}
+              onClose={() => setIsHistoryOpen(false)}
+              sessions={sessions}
+              currentSessionId={currentSessionId}
+              onSessionSelect={handleSessionSelect}
+              onNewConversation={handleNewConversation}
+            />
+            
+            {(error || wsError) && (
+              <div className="w-full px-4 mt-20 mb-4"> 
+                <div className="bg-red-50 dark:bg-red-900 border border-red-200 dark:border-red-700 text-red-700 dark:text-red-200 px-4 py-3 rounded relative">
+                  <strong className="font-bold">Error: </strong>
+                  <span className="block sm:inline">{error || wsError}</span>
+                  <button
+                    className="absolute top-0 right-0 px-4 py-3"
+                    onClick={() => {
+                      setError(null);
+                      setWsError(null);
+                    }}
+                  >
+                    <span className="sr-only">Dismiss</span>
+                    <span className="text-red-500">&times;</span>
+                  </button>
+                </div>
+              </div>
+            )}
+             <GradientBackground />
+            <main className={cn(
+              "relative",
+              "flex-grow w-full",
+              "flex flex-col",
+              "pt-16 sm:pt-32 px-4",
+            )}>
+              <div className="w-full mt-16 sm:mt-0">
+                {currentConversation.length === 0 && showInitialQuestions && !isStreaming && !isLoading ? (
+                  <div className="relative w-full min-h-[calc(100vh-200px)] flex flex-col items-center justify-center px-4">
+                   
+                    
+                    <div className="relative z-10 max-w-3xl w-full mx-auto space-y-12">
+                      {/* Animated Welcome Text */}
+                      <div className="text-center space-y-4 animate-fade-in">
+                        <h1 className="text-4xl sm:text-5xl font-bold">
+                          <span className="block">Curious about</span>
+                          <span className="bg-clip-text text-[#179BD7] bg-gradient-to-r from-[#1a5f00] via-[#2f8c04] to-[#1a5f00]">
+                            <AnimatedText texts={rotatingTexts} />
+                          </span>
+                        </h1>
+                        
+                      </div>
+
+                      {/* Enhanced Search Bar */}
+                      <div className="w-full transform animate-float-up rounded-xl">
+                        <SearchBar 
+                          loading={isLoading}
+                          searchQuery={searchQuery}
+                          processingQuery={processingQuery}
+                          onSearch={handleSearch}
+                          onNewConversation={handleNewConversation}
+                          setSearchQuery={setSearchQuery}
+                          className="shadow-lg hover:shadow-xl transition-shadow duration-300 rounded-xl"
+                          isLarge={true}
+                        />
+                      </div>
+
+                      {/* Example Questions */}
+                      <div className="w-full space-y-6 animate-fade-in-delayed">
+                        <p className="text-center text-gray-500 text-sm uppercase tracking-wider font-medium">
+                          Try asking
+                        </p>
+                        <div className="grid gap-3 grid-cols-1 sm:grid-cols-3 w-full max-w-4xl mx-auto">
+                          {randomQuestions.slice(0, 3).map((question, index) => (
+                            <button
+                              key={index}
+                              onClick={() => handleQuestionSelect(question, index)}
+                              disabled={isLoading && loadingQuestionIndex === index}
+                              className={cn(
+                                "group relative px-6 py-6",
+                                "bg-white/50 backdrop-blur-sm rounded-xl",
+                                "border border-gray-100 shadow-md",
+                                "hover:bg-white/80 hover:shadow-xl",
+                                "dark:bg-[#1F2937]",
+                                "dark:text-white",
+                                "dark:border-none",
+                                "transition-all duration-300 ease-in-out",
+                                "animate-slide-up-fade",
+                                "lg:min-h-[120px]",
+                                "flex items-center",
+                                "w-full",
+                                "transform hover:scale-[1.02]",
+                                "",
+                                isLoading && loadingQuestionIndex === index ? "opacity-70 cursor-not-allowed" : "cursor-pointer"
+                              )}
+                              style={{
+                                animationDelay: `${(index + 1) * 0.2}s`,
+                                animationFillMode: 'both'
+                              }}
+                            >
+                              <div className="absolute inset-0 bg-gradient-to-r from-[rgba(23,155,215,0.1)] to-transparent 
+                                            opacity-0 group-hover:opacity-100 transition-opacity duration-300 
+                                            rounded-xl" />
+                              
+                              <span className="relative z-10 block text-sm text-gray-800 dark:text-gray-300 text-left line-clamp-3 
+                                            group-hover:text-gray-900 dark:group-hover:text-white transition-colors duration-300">
+                                {question}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  // Updated conversations view with enhanced scrolling
+                  renderConversations()
+                )}
+              </div>
+            </main>
+
+            {!showInitialQuestions && (
+              <div className="fixed bottom-0 left-0 right-0 bg-white dark:bg-gray-800 border-t dark:border-gray-700">
+                <div className="w-full mx-auto px-0">
+                  <SearchBar 
+                    loading={isLoading}
+                    searchQuery={searchQuery}
+                    processingQuery={processingQuery}
+                    onSearch={handleSearch}
+                    onNewConversation={handleNewConversation}
+                    setSearchQuery={setSearchQuery}
+                    className=" dark:bg-gray-800"
+                    isLarge={true}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+// SearchBar Component
+const SearchBar = ({ 
+  loading, 
+  searchQuery, 
+  processingQuery, 
+  onSearch, 
+  onNewConversation, 
+  setSearchQuery,
+  className,
+  isLarge = false,
+  disabled = false
+}: {
+  loading: boolean;
+  searchQuery: string;
+  processingQuery: string;
+  onSearch: (e: React.FormEvent) => void;
+  onNewConversation: () => void;
+  setSearchQuery: (query: string) => void;
+  className?: string;
+  isLarge?: boolean;
+  disabled?: boolean;
+}) => {
+  // Add handler for key press
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (!loading && searchQuery.trim()) {
+        onSearch(e);
+      }
+    }
+  };
+
+  // Add button click handler
+  const handleButtonClick = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      await onNewConversation();
+    } catch (error) {
+      console.error('Error creating new conversation:', error);
+    }
+  };
+
+  return (
+    <div className="w-full py-3">
+      <form 
+        onSubmit={onSearch} 
+        className={cn(
+          "w-full flex items-center bg-white dark:bg-gray-800 py-1.5 rounded-xl",
+          "px-4 md:px-8 lg:px-12",
+          disabled && "bg-gray-50 dark:bg-gray-700",
+          className
+        )}
+      >
+        <Button
+          onClick={handleButtonClick}
+          variant="ghost"
+          size="icon"
+          className={cn(
+            "flex items-center justify-center flex-shrink-0 ml-4",
+            isLarge ? "h-[46px] w-[46px]" : "h-[42px] w-[42px]"
+          )}
+          disabled={disabled}
+        >
+          <PlusCircle className={cn(
+            isLarge ? "h-6 w-6" : "h-5 w-5",
+            "text-gray-400",
+            disabled && "text-gray-300"
+          )} />
+        </Button>
+
+        <Textarea
+          value={loading ? processingQuery : searchQuery}
+          onChange={(e) => !loading && setSearchQuery(e.target.value)}
+          onKeyDown={handleKeyPress}
+          placeholder="Ask your question..."
+          disabled={disabled}
+          className={cn(
+            "flex-grow mx-2",
+            isLarge ? "text-base" : "text-sm",
+            "transition-all duration-200 ease-out",
+            "placeholder:text-gray-400",
+            "focus:placeholder:opacity-0",
+            "resize-none",
+            "question-textarea",
+            "hide-scrollbar",
+            "outline-none",
+            "focus:ring-0",
+            "focus-visible:ring-0",
+            "focus-visible:outline-none",
+            "focus:border-0",
+            "active:outline-none",
+            "active:ring-0",
+            "touch-none",
+            "dark:bg-gray-800 dark:text-gray-200",
+            "dark:placeholder:text-gray-400",
+            "border-none",
+            loading && "opacity-50",
+            disabled && "bg-transparent dark:bg-transparent cursor-default"
+          )}
+          style={{
+            minHeight: isLarge ? '46px' : '42px',
+            height: searchQuery ? 'auto' : isLarge ? '46px' : '42px',
+            resize: 'none',
+            lineHeight: '1.5',
+            outline: 'none',
+            boxShadow: 'none',
+            paddingTop: isLarge ? '12px' : '10px',
+            paddingBottom: isLarge ? '12px' : '10px',
+            overflow: 'hidden',
+            msOverflowStyle: 'none',
+            scrollbarWidth: 'none'
+          }}
+        />
+
+        <Button
+          type="submit"
+          variant="ghost"
+          size="icon"
+          className={cn(
+            "flex items-center justify-center flex-shrink-0 mr-4",
+            isLarge ? "h-[46px] w-[46px]" : "h-[42px] w-[42px]"
+          )}
+          disabled={loading || disabled}
+        >
+          {loading ? (
+            <span className="animate-spin">⌛</span>
+          ) : (
+            <ArrowRight className={cn(
+              isLarge ? "h-6 w-6" : "h-5 w-5",
+              "text-gray-400",
+              disabled && "text-gray-300"
+            )} />
+          )}
+        </Button>
+      </form>
+    </div>
+  );
+};
+
+const processingSteps = [
+  "Understanding Query",
+  "Searching Knowledge Base",
+  "Processing Data",
+  "Generating Answer"
+];
