@@ -585,7 +585,7 @@ const ConversationHistoryButton = ({
                 variant="ghost"
               >
                 <PlusCircle className="mr-2 h-4 w-4" />
-                New Conversatio
+                New Conversation
               </Button>
               <div className="space-y-1 max-h-96 overflow-y-auto">
                 {sessions.map((session) => (
